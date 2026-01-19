@@ -798,4 +798,112 @@ elif page == "Segmentation (STP)":
             }
         )
 
-    labels_df = pd.DataFram_
+    labels_df = pd.DataFrame(label_rows).sort_values("share", ascending=False)
+    st.dataframe(labels_df, use_container_width=True, height=320)
+
+    st.success(
+        "GTM implication: pick 1–2 primary segments to win first, then expand. "
+        "Trying to be everything to everyone makes you a beige commodity with a logo."
+    )
+
+
+# =========================
+# Page: Positioning & Perceptual Maps
+# =========================
+elif page == "Positioning & Perceptual Maps":
+    st.subheader("Positioning & Perceptual Mapping (category reality check)")
+
+    st.markdown(
+        "Your dataset does not include direct ‘Sustainability’ or ‘Trust’ scales. "
+        "So the dashboard uses **defensible proxies**:\n\n"
+        "- **Price axis proxy:** Value-for-money importance (higher = more price sensitive)\n"
+        "- **Quality axis proxy:** Taste + Source importance (higher = quality-seeking)\n"
+        "- **Sustainability proxy:** Packaging type importance (common sustainability cue in bottled water)\n"
+        "- **Trust proxy:** Brand name importance (brand as trust shorthand)\n\n"
+        "This is not perfect, but it’s honest and useful for early GTM."
+    )
+
+    if not importance_cols or col_most_freq_brand is None:
+        st.error("Perceptual mapping requires importance ratings + most-frequently purchased brand column.")
+        st.stop()
+
+    # Build brand-level averages based on the brand purchased most frequently
+    brand_df = df_f.copy()
+    brand_df["brand_key"] = brand_df[col_most_freq_brand].astype(str).str.strip()
+
+    # Create composite scores
+    def col_or_nan(cname: str) -> pd.Series:
+        return brand_df[cname] if cname in brand_df.columns else np.nan
+
+    price_proxy = "how_important_is_value_for_money_in_purchasing_bottled_water"
+    quality_proxy_1 = "how_important_is_taste_in_purchasing_bottled_water"
+    quality_proxy_2 = "how_important_is_source_of_water_in_purchasing_bottled_water"
+    sust_proxy = "how_important_is_packaging_type_in_purchasing_bottled_water"
+    trust_proxy = "how_important_is_brand_name_in_purchasing_bottled_water"
+
+    brand_df["quality_proxy"] = (col_or_nan(quality_proxy_1) + col_or_nan(quality_proxy_2)) / 2
+    brand_df["price_proxy"] = col_or_nan(price_proxy)
+    brand_df["sust_proxy"] = col_or_nan(sust_proxy)
+    brand_df["trust_proxy"] = col_or_nan(trust_proxy)
+
+    brand_map = (
+        brand_df.groupby("brand_key")[["quality_proxy", "price_proxy", "sust_proxy", "trust_proxy", "monthly_spend_aed"]]
+        .mean()
+        .reset_index()
+    )
+
+    # Keep only brands with enough samples for stability
+    counts = brand_df["brand_key"].value_counts().reset_index()
+    counts.columns = ["brand_key", "n"]
+    brand_map = brand_map.merge(counts, on="brand_key", how="left")
+    brand_map = brand_map[brand_map["n"] >= 5].copy()
+
+    if brand_map.empty:
+        st.warning(
+            "Not enough repeated brand selections to build a stable brand map (needs >= 5 respondents per brand). "
+            "Try relaxing the filter or using overall expectations instead of brand-level."
+        )
+        st.stop()
+
+    # Map 1: Price vs Quality
+    st.markdown("### Perceptual map 1: Price sensitivity vs Quality seeking (brand-level)")
+    fig1 = px.scatter(
+        brand_map,
+        x="price_proxy",
+        y="quality_proxy",
+        size="n",
+        hover_name="brand_key",
+        title="Price (value-for-money importance) vs Quality (taste+source importance)",
+    )
+    fig1.update_layout(height=520, xaxis_title="Price sensitivity proxy (higher = more price sensitive)",
+                       yaxis_title="Quality-seeking proxy (higher = cares more about taste+source)")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    st.caption(
+        "So what? This shows which brands are associated with consumers who care more about quality cues vs price cues. "
+        "GTM implication: IOTA should choose a battlefield: out-quality the market (proof + product) or out-value it (packs + pricing)."
+    )
+
+    # Map 2: Sustainability proxy vs Trust proxy
+    st.markdown("### Perceptual map 2: Packaging importance vs Brand trust importance (brand-level)")
+    fig2 = px.scatter(
+        brand_map,
+        x="sust_proxy",
+        y="trust_proxy",
+        size="n",
+        hover_name="brand_key",
+        title="Packaging (proxy for sustainability cue) vs Brand name (proxy for trust cue)",
+    )
+    fig2.update_layout(height=520, xaxis_title="Packaging importance proxy",
+                       yaxis_title="Brand importance proxy")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.caption(
+        "So what? If packaging cues matter, there’s room for eco/format differentiation. "
+        "If brand trust dominates, distribution and credibility loops matter more than feature tweaks."
+    )
+
+    st.success(
+        "Positioning takeaway: pick a primary axis to own (quality proof, functional benefits, or value economics), "
+        "then design packaging + channels to reinforce it everywhere."
+    )
