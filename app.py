@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -13,20 +12,18 @@ import statsmodels.api as sm
 
 
 # ======================
-# Page config
+# Config
 # ======================
 st.set_page_config(page_title="IOTA Water UAE | GTM Dashboard", layout="wide")
 st.title("IOTA Water UAE | GTM Analytics Dashboard")
-st.caption(
-    "Interactive GTM analytics for UAE bottled water survey data. "
-    "Includes KPI metrics, correlation heatmap, regression, and configurable STP segmentation + perceptual mapping."
-)
+st.caption("KPIs + Perceptual Mapping + Regression + STP Segmentation (KMeans)")
+
+DATA_PATH = "data/gip final data.csv"  # ✅ your new filename
+
 
 # ======================
-# Data load (local repo)
+# Load
 # ======================
-DATA_PATH = "data/Research_for_bottled_water_UAE_200_respondents.csv"
-
 @st.cache_data(show_spinner=False)
 def load_data(path: str):
     if not os.path.exists(path):
@@ -37,31 +34,29 @@ df_raw = load_data(DATA_PATH)
 if df_raw is None:
     st.error(
         f"Dataset not found at `{DATA_PATH}`.\n\n"
-        "Fix: Upload your CSV into `data/` folder in GitHub with the exact filename, then redeploy."
+        "Make sure your repo has:\n"
+        "data/gip final data.csv\n\n"
+        "Then redeploy Streamlit Cloud."
     )
     st.stop()
+
 
 # ======================
 # Helpers
 # ======================
-def clean_col(col: str) -> str:
-    col = str(col).lower().strip()
+def standardize_col(col: str) -> str:
+    col = str(col).replace("\ufeff", "")  # remove BOM
+    col = col.strip().lower()
     col = re.sub(r"[^\w\s]", " ", col)
     col = re.sub(r"\s+", "_", col)
+    col = re.sub(r"_+", "_", col)
     return col.strip("_")
 
 def median_impute(s: pd.Series) -> pd.Series:
-    if s.dropna().empty:
-        return s
-    return s.fillna(s.median())
+    return s.fillna(s.median()) if not s.dropna().empty else s
 
 def mode_impute(s: pd.Series) -> pd.Series:
-    if s.dropna().empty:
-        return s
-    return s.fillna(s.mode().iloc[0])
-
-def safe_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+    return s.fillna(s.dropna().mode().iloc[0]) if not s.dropna().empty else s
 
 def spend_to_aed(x) -> float:
     if pd.isna(x):
@@ -86,17 +81,17 @@ def spend_to_aed(x) -> float:
         return float(nums[0])
     return np.nan
 
-def freq_score(x) -> float:
+def freq_to_score(x) -> float:
     if pd.isna(x):
         return np.nan
     s = str(x).strip().lower()
     if "more than once a week" in s:
         return 5
-    if "once a week" in s:
+    if "once a week" in s or "once a week" in s or "once a week" in s:
         return 4
-    if "fortnight" in s:
+    if "fortnight" in s or "fortnite" in s:
         return 3
-    if "once a month" in s or "monthly" in s:
+    if "once a month" in s or "month" in s:
         return 2
     if "rare" in s:
         return 1
@@ -104,7 +99,7 @@ def freq_score(x) -> float:
         return 0
     return np.nan
 
-def yes_no_to_binary(x) -> float:
+def yesno_to_bin(x) -> float:
     if pd.isna(x):
         return np.nan
     s = str(x).strip().lower()
@@ -114,153 +109,197 @@ def yes_no_to_binary(x) -> float:
         return 0.0
     return np.nan
 
-def encode_for_modeling(df_in: pd.DataFrame, cols: list) -> tuple[pd.DataFrame, list]:
-    """
-    Builds a modeling matrix:
-    - Numeric columns kept numeric
-    - Categorical columns one-hot encoded
-    Returns (X_df, feature_names)
-    """
+def split_brands(x) -> list:
+    if pd.isna(x):
+        return []
+    return [b.strip() for b in str(x).split(",") if b.strip()]
+
+def encode_for_clustering(df_in: pd.DataFrame, cols: list) -> pd.DataFrame:
     X = df_in[cols].copy()
 
-    # Attempt to convert "rating-like" strings to numeric
+    # Try numeric coercion when possible
     for c in X.columns:
         if X[c].dtype == "object":
-            # if it looks mostly numeric, coerce
             coerced = pd.to_numeric(X[c], errors="coerce")
-            numeric_ratio = coerced.notna().mean()
-            if numeric_ratio > 0.75:
+            if coerced.notna().mean() > 0.75:
                 X[c] = coerced
 
-    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
-    cat_cols = [c for c in X.columns if c not in num_cols]
+    num = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat = [c for c in X.columns if c not in num]
 
-    # Impute
-    for c in num_cols:
+    for c in num:
         X[c] = median_impute(X[c])
-
-    for c in cat_cols:
+    for c in cat:
         X[c] = mode_impute(X[c])
 
-    # One-hot encode categoricals
-    if cat_cols:
-        X = pd.get_dummies(X, columns=cat_cols, drop_first=False)
+    if cat:
+        X = pd.get_dummies(X, columns=cat, drop_first=False)
 
-    return X, X.columns.tolist()
-
-def top_differentiators(profile_df: pd.DataFrame, top_n: int = 6) -> pd.DataFrame:
-    """
-    Finds columns with the highest variance across segments (simple differentiator heuristic).
-    """
-    diffs = profile_df.drop(columns=["segment"], errors="ignore").var().sort_values(ascending=False)
-    out = diffs.head(top_n).reset_index()
-    out.columns = ["attribute", "between_segment_variance"]
-    return out
+    return X
 
 
 # ======================
-# Clean and feature engineering
+# Clean + feature engineering
 # ======================
 df = df_raw.copy()
-df.columns = [clean_col(c) for c in df.columns]
+df.columns = [standardize_col(c) for c in df.columns]
 
-# Known columns (from your dataset pattern)
-COL_SPEND = "what_is_your_average_monthly_spent_on_water_in_a_month"
-COL_FREQ = "how_often_do_you_purchase_packaged_drinking_water"
-COL_BUY_EATOUT = "do_you_buy_water_while_eating_out"
+# Drop useless empty index-like column if present (your file has Column1)
+for junk in ["column1", ""]:
+    if junk in df.columns:
+        df = df.drop(columns=[junk], errors="ignore")
 
-if COL_SPEND in df.columns:
-    df["monthly_spend_aed"] = df[COL_SPEND].apply(spend_to_aed)
-else:
-    df["monthly_spend_aed"] = np.nan
+# Identify key columns by standardized names
+col_spend = "what_is_your_average_monthly_spent_on_water_in_a_month"
+col_freq = "how_often_do_you_purchase_packaged_drinking_water"
+col_eatout = "how_often_do_you_eat_out"
+col_buy_eatout = "do_you_buy_water_while_eating_out"
+col_channel = "where_do_you_usually_buy_bottled_water"
+col_pack = "size_of_bottled_water"
+col_awareness = "which_brands_are_you_aware_of"
+col_brand_buy = "which_brands_of_bottled_water_do_you_purchase_most_frequently"
 
-if COL_FREQ in df.columns:
-    df["purchase_freq_score"] = df[COL_FREQ].apply(freq_score)
-else:
-    df["purchase_freq_score"] = np.nan
+# Attribute ratings (your perception map core)
+attribute_cols = [
+    "value_for_money",
+    "packaging_type",
+    "added_benefits",
+    "source_of_water",
+    "availability",
+    "taste",
+    "brand_name",
+    "attractive_promotions",
+]
+attribute_cols = [c for c in attribute_cols if c in df.columns]
 
-if COL_BUY_EATOUT in df.columns:
-    df["buys_water_when_eating_out"] = df[COL_BUY_EATOUT].apply(yes_no_to_binary)
-else:
-    df["buys_water_when_eating_out"] = np.nan
+# engineered numeric columns
+df["monthly_spend_aed"] = df[col_spend].apply(spend_to_aed) if col_spend in df.columns else np.nan
+df["purchase_freq_score"] = df[col_freq].apply(freq_to_score) if col_freq in df.columns else np.nan
+df["eatout_freq_score"] = df[col_eatout].apply(freq_to_score) if col_eatout in df.columns else np.nan
+df["buys_water_when_eating_out"] = df[col_buy_eatout].apply(yesno_to_bin) if col_buy_eatout in df.columns else np.nan
 
-# Global impute pass
+# Impute
 num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 cat_cols = [c for c in df.columns if c not in num_cols]
-
 for c in num_cols:
     df[c] = median_impute(df[c])
-
 for c in cat_cols:
     df[c] = mode_impute(df[c])
 
-# Detect driver columns (importance ratings)
-importance_cols = [c for c in df.columns if c.startswith("how_important")]
-
 # ======================
-# Sidebar navigation + filters
+# Sidebar navigation
 # ======================
 with st.sidebar:
     st.header("Navigation")
     page = st.radio(
         "Go to",
-        ["Data Overview", "KPI Metrics", "Correlation Heatmap", "Regression", "Segmentation (STP)", "Positioning & Perceptual Maps"],
-        index=0
+        ["Data Overview", "KPI Metrics", "Correlation Heatmap", "Regression", "Segmentation (STP)", "Positioning & Perceptual Map"],
+        index=1
     )
+
     st.divider()
-    st.caption("Data file loaded from repo:")
+    st.caption("Data file:")
     st.code(DATA_PATH)
 
 # ======================
-# PAGES
+# Pages
 # ======================
 if page == "Data Overview":
-    st.subheader("Data Overview & Health Check")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Respondents", f"{df.shape[0]:,}")
-    c2.metric("Variables", f"{df.shape[1]:,}")
-    c3.metric("Numeric cols", f"{len(num_cols):,}")
-    c4.metric("Driver (importance) cols", f"{len(importance_cols):,}")
-
-    with st.expander("Preview (first 25 rows)", expanded=True):
-        st.dataframe(df.head(25), use_container_width=True)
-
-    st.info("So what? If this loads, your data pipeline and Streamlit deployment are stable.")
+    st.subheader("Data Overview")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows", f"{df.shape[0]:,}")
+    c2.metric("Columns", f"{df.shape[1]:,}")
+    c3.metric("Perception attributes detected", f"{len(attribute_cols):,}")
+    st.dataframe(df.head(25), use_container_width=True)
 
 elif page == "KPI Metrics":
     st.subheader("KPI Metrics (Executive Snapshot)")
 
-    avg_spend = float(df["monthly_spend_aed"].mean()) if "monthly_spend_aed" in df.columns else np.nan
-    med_spend = float(df["monthly_spend_aed"].median()) if "monthly_spend_aed" in df.columns else np.nan
-    avg_freq = float(df["purchase_freq_score"].mean()) if "purchase_freq_score" in df.columns else np.nan
-    pct_eatout = float(df["buys_water_when_eating_out"].mean() * 100) if "buys_water_when_eating_out" in df.columns else np.nan
+    avg_spend = float(df["monthly_spend_aed"].mean())
+    med_spend = float(df["monthly_spend_aed"].median())
+    heavy_spend_cut = float(df["monthly_spend_aed"].quantile(0.75))
+    heavy_spend_pct = float((df["monthly_spend_aed"] >= heavy_spend_cut).mean() * 100)
+
+    avg_freq = float(df["purchase_freq_score"].mean())
+    heavy_freq_pct = float((df["purchase_freq_score"] >= 4).mean() * 100)
+
+    eatout_buy_pct = float(df["buys_water_when_eating_out"].mean() * 100) if "buys_water_when_eating_out" in df.columns else np.nan
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Avg Monthly Spend (AED, proxy)", f"{avg_spend:,.0f}")
     c2.metric("Median Monthly Spend (AED, proxy)", f"{med_spend:,.0f}")
-    c3.metric("Avg Purchase Frequency Score", f"{avg_freq:.2f}")
-    c4.metric("% Buy Water When Eating Out", f"{pct_eatout:.1f}%")
+    c3.metric("Heavy Buyers (Top 25%)", f"{heavy_spend_pct:.1f}%")
+    c4.metric("High Frequency Buyers (weekly+)", f"{heavy_freq_pct:.1f}%")
 
-    st.caption(
-        "So what? These four numbers already steer big GTM choices: premium vs value, channel intensity, "
-        "and whether out-of-home is a meaningful battleground."
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Avg Purchase Frequency Score", f"{avg_freq:.2f}")
+    c6.metric("% Buy Water While Eating Out", f"{eatout_buy_pct:.1f}%")
+    c7.metric("Attributes used (for perception)", f"{len(attribute_cols):,}")
+
+    st.divider()
+
+    # Top channel and pack size
+    if col_channel in df.columns:
+        vc = df[col_channel].value_counts(normalize=True).reset_index()
+        vc.columns = ["channel", "share"]
+        fig = px.bar(vc, x="channel", y="share", title="Channel Share")
+        fig.update_layout(height=380, yaxis_tickformat=".0%")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if col_pack in df.columns:
+        vc2 = df[col_pack].value_counts(normalize=True).reset_index()
+        vc2.columns = ["pack_size", "share"]
+        fig2 = px.bar(vc2, x="pack_size", y="share", title="Pack Size Share")
+        fig2.update_layout(height=380, yaxis_tickformat=".0%")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Top drivers
+    if attribute_cols:
+        means = df[attribute_cols].mean().sort_values(ascending=False).reset_index()
+        means.columns = ["driver", "avg_score"]
+        fig3 = px.bar(means, x="avg_score", y="driver", orientation="h", title="Top Purchase Drivers (Avg Rating)")
+        fig3.update_layout(height=420)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Brand awareness and purchase
+    colA, colB = st.columns(2)
+
+    if col_awareness in df.columns:
+        all_aw = []
+        for x in df[col_awareness].tolist():
+            all_aw.extend(split_brands(x))
+        aw = pd.Series(all_aw).value_counts().head(15).reset_index()
+        aw.columns = ["brand", "mentions"]
+        figA = px.bar(aw, x="brand", y="mentions", title="Top Brand Awareness (mentions)")
+        figA.update_layout(height=420)
+        colA.plotly_chart(figA, use_container_width=True)
+
+    if col_brand_buy in df.columns:
+        buy = df[col_brand_buy].astype(str).value_counts().head(15).reset_index()
+        buy.columns = ["brand", "respondents"]
+        figB = px.bar(buy, x="brand", y="respondents", title="Most Frequently Purchased Brand")
+        figB.update_layout(height=420)
+        colB.plotly_chart(figB, use_container_width=True)
+
+    st.info(
+        "So what? These KPIs define your launch reality: spend capacity (WTP proxy), buying intensity, "
+        "distribution priorities, and what people actually value."
     )
 
 elif page == "Correlation Heatmap":
-    st.subheader("Correlation Heatmap (choose what to include)")
+    st.subheader("Correlation Heatmap")
 
     numeric_candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    default_heat = [c for c in (importance_cols + ["monthly_spend_aed", "purchase_freq_score"]) if c in numeric_candidates]
+    default_heat = [c for c in (attribute_cols + ["monthly_spend_aed", "purchase_freq_score"]) if c in numeric_candidates]
 
     selected = st.multiselect(
-        "Select numeric columns for correlation",
+        "Select numeric columns",
         options=numeric_candidates,
         default=default_heat if len(default_heat) >= 3 else numeric_candidates[:10]
     )
 
     if len(selected) < 3:
-        st.warning("Select at least 3 numeric columns to build a meaningful heatmap.")
+        st.warning("Select at least 3 numeric columns.")
         st.stop()
 
     corr = df[selected].corr(numeric_only=True)
@@ -269,43 +308,37 @@ elif page == "Correlation Heatmap":
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        "So what? Correlation helps you spot bundles of preferences. "
-        "GTM implication: message stacks should align with what consumers mentally group together."
+        "So what? Correlation shows which perceptions travel together. "
+        "GTM implication: position with a coherent bundle of drivers, not random claims."
     )
 
 elif page == "Regression":
-    st.subheader("Regression (configurable): Choose outcome + drivers")
+    st.subheader("Regression (Configurable)")
 
-    if "monthly_spend_aed" not in df.columns:
-        st.error("monthly_spend_aed not available. Check spend mapping.")
+    numeric_outcomes = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if "monthly_spend_aed" not in numeric_outcomes:
+        st.error("monthly_spend_aed not available.")
         st.stop()
 
-    outcome_options = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    y_col = st.selectbox("Dependent variable (Outcome)", outcome_options, index=outcome_options.index("monthly_spend_aed"))
+    y_col = st.selectbox("Dependent variable (Outcome)", numeric_outcomes, index=numeric_outcomes.index("monthly_spend_aed"))
 
-    feature_pool = df.columns.tolist()
-    default_features = [c for c in importance_cols if c in feature_pool]
-    for extra in ["purchase_freq_score", "buys_water_when_eating_out"]:
-        if extra in feature_pool:
-            default_features.append(extra)
+    default_X = attribute_cols + ["purchase_freq_score", "eatout_freq_score", "buys_water_when_eating_out"]
+    default_X = [c for c in default_X if c in df.columns]
 
-    X_cols = st.multiselect(
-        "Independent variables (Drivers)",
-        options=feature_pool,
-        default=default_features
-    )
-
+    X_cols = st.multiselect("Independent variables (Drivers)", df.columns.tolist(), default=default_X)
     if len(X_cols) < 3:
-        st.warning("Select at least 3 independent variables for regression.")
+        st.warning("Pick at least 3 predictors.")
         st.stop()
 
     model_df = df[[y_col] + X_cols].replace([np.inf, -np.inf], np.nan).dropna()
     if model_df.empty:
-        st.error("No usable rows after dropping missing values. Reduce selected columns.")
+        st.error("No usable rows after dropping missing values. Reduce columns.")
         st.stop()
 
-    X_encoded, feature_names = encode_for_modeling(model_df, X_cols)
-    X = sm.add_constant(X_encoded)
+    # Encode categoricals if user picked any
+    X = model_df[X_cols].copy()
+    X = pd.get_dummies(X, drop_first=False)
+    X = sm.add_constant(X)
     y = model_df[y_col]
 
     model = sm.OLS(y, X).fit()
@@ -314,230 +347,153 @@ elif page == "Regression":
         "feature": model.params.index,
         "coef": model.params.values,
         "p_value": model.pvalues.values
-    }).sort_values("p_value", ascending=True)
+    }).sort_values("p_value")
 
     c1, c2 = st.columns([1.2, 0.8])
-    with c1:
-        st.dataframe(results.head(40), use_container_width=True, height=520)
+    c1.dataframe(results.head(50), use_container_width=True, height=520)
+    c2.metric("R-squared", f"{model.rsquared:.3f}")
+    c2.metric("Observations", f"{len(model_df):,}")
 
-    with c2:
-        st.metric("R-squared", f"{model.rsquared:.3f}")
-        st.metric("Observations", f"{len(model_df):,}")
+    sig = results[(results["feature"] != "const") & (results["p_value"] < 0.05)].head(8)
+    c2.markdown("**Top significant drivers (p < 0.05):**")
+    if sig.empty:
+        c2.write("None in this configuration.")
+    else:
+        for _, r in sig.iterrows():
+            direction = "↑" if r["coef"] > 0 else "↓"
+            c2.write(f"- {direction} `{r['feature']}` (coef={r['coef']:.2f})")
 
-        sig = results[(results["feature"] != "const") & (results["p_value"] < 0.05)].head(8)
-        st.markdown("**Top significant drivers (p < 0.05):**")
-        if sig.empty:
-            st.write("None in this configuration (try different columns).")
-        else:
-            for _, r in sig.iterrows():
-                direction = "↑" if r["coef"] > 0 else "↓"
-                st.write(f"- {direction} `{r['feature']}` (coef={r['coef']:.2f})")
-
-    st.caption(
-        "So what? This turns survey attributes into a data-backed GTM narrative. "
-        "Use significant drivers to choose claims, packaging cues, and pricing architecture."
+    st.info(
+        "So what? Significant coefficients are the data-backed drivers of WTP/spend. "
+        "GTM implication: focus product + messaging on what statistically moves value."
     )
 
 elif page == "Segmentation (STP)":
-    st.subheader("Segmentation (STP): Choose any attributes, then cluster")
+    st.subheader("STP Segmentation (KMeans)")
 
     st.markdown(
-        "Pick the attributes you want to segment on. This supports **demographics + behavior + attitudes**.\n\n"
-        "Behind the scenes:\n"
-        "- Numeric columns are standardized\n"
-        "- Categorical columns are one-hot encoded\n"
-        "- K-Means builds segments\n"
+        "Choose the attributes to segment on. Categorical variables will be one-hot encoded automatically."
     )
 
-    # Attribute picker: let you truly use "all attributes"
-    all_cols = df.columns.tolist()
+    default_seg = attribute_cols + ["monthly_spend_aed", "purchase_freq_score", "eatout_freq_score", "buys_water_when_eating_out"]
+    default_seg = [c for c in default_seg if c in df.columns]
 
-    # Good defaults (you can change)
-    default_seg = []
-    default_seg += importance_cols
-    for extra in ["monthly_spend_aed", "purchase_freq_score", "buys_water_when_eating_out"]:
-        if extra in df.columns:
-            default_seg.append(extra)
-
-    seg_cols = st.multiselect(
-        "Attributes to use for segmentation",
-        options=all_cols,
-        default=default_seg
-    )
-
+    seg_cols = st.multiselect("Segmentation attributes", df.columns.tolist(), default=default_seg)
     if len(seg_cols) < 4:
-        st.warning("Choose at least 4 attributes to create stable segments.")
+        st.warning("Pick at least 4 attributes for stable segmentation.")
         st.stop()
 
     k = st.slider("Number of segments (K)", 3, 8, 4)
 
-    seg_work = df[seg_cols].replace([np.inf, -np.inf], np.nan).copy()
+    X = encode_for_clustering(df, seg_cols)
+    Xs = StandardScaler().fit_transform(X)
 
-    # Encode (numeric + one-hot categoricals)
-    X_encoded, feat_names = encode_for_modeling(seg_work, seg_cols)
+    km = KMeans(n_clusters=k, random_state=42, n_init=25)
+    df_seg = df.copy()
+    df_seg["segment"] = km.fit_predict(Xs)
 
-    # Standardize for clustering
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X_encoded)
-
-    km = KMeans(n_clusters=k, random_state=42, n_init=20)
-    segments = km.fit_predict(Xs)
-
-    out = df.copy()
-    out["segment"] = segments
-
-    # Segment sizes
-    sizes = out["segment"].value_counts().sort_index().reset_index()
+    sizes = df_seg["segment"].value_counts().sort_index().reset_index()
     sizes.columns = ["segment", "respondents"]
 
     c1, c2 = st.columns([0.7, 1.3])
-    with c1:
-        st.markdown("### Segment sizes")
-        st.dataframe(sizes, use_container_width=True, height=260)
+    c1.dataframe(sizes, use_container_width=True, height=240)
+    fig = px.bar(sizes, x="segment", y="respondents", title="Segment Size")
+    fig.update_layout(height=320)
+    c2.plotly_chart(fig, use_container_width=True)
 
-    with c2:
-        fig = px.bar(sizes, x="segment", y="respondents", title="Segment Size")
-        fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Segment profiling:
-    # - numeric means
-    # - categorical modes (top categories)
-    st.markdown("### Segment profile (what makes each segment different?)")
-
-    num_profile_cols = [c for c in seg_cols if pd.api.types.is_numeric_dtype(out[c])]
-    cat_profile_cols = [c for c in seg_cols if c not in num_profile_cols]
-
-    profile_blocks = []
-
-    if num_profile_cols:
-        num_profile = out.groupby("segment")[num_profile_cols].mean().reset_index()
-        st.write("**Numeric averages (within segment):**")
-        st.dataframe(num_profile, use_container_width=True, height=380)
-        profile_blocks.append(("numeric", num_profile))
-
-    if cat_profile_cols:
-        st.write("**Top categorical values (within segment):**")
-        cat_summary = []
-        for seg_id in sorted(out["segment"].unique()):
-            seg_slice = out[out["segment"] == seg_id]
-            for c in cat_profile_cols:
-                top_val = seg_slice[c].astype(str).value_counts().head(1)
-                if not top_val.empty:
-                    cat_summary.append({
-                        "segment": seg_id,
-                        "attribute": c,
-                        "top_value": top_val.index[0],
-                        "share": float(top_val.iloc[0] / len(seg_slice))
-                    })
-        cat_summary_df = pd.DataFrame(cat_summary)
-        st.dataframe(cat_summary_df, use_container_width=True, height=420)
-
-    # Differentiators (simple variance-based)
-    if num_profile_cols:
-        diffs = top_differentiators(num_profile, top_n=8)
-        st.markdown("### Top differentiating attributes (quick heuristic)")
-        st.dataframe(diffs, use_container_width=True, height=300)
+    # Profile: numeric means for selected columns
+    prof_cols = [c for c in seg_cols if pd.api.types.is_numeric_dtype(df_seg[c])]
+    if prof_cols:
+        profile = df_seg.groupby("segment")[prof_cols].mean().reset_index()
+        st.markdown("### Segment Profile (numeric means)")
+        st.dataframe(profile, use_container_width=True, height=420)
 
     st.success(
-        "GTM implication: after finding stable segments, pick 1–2 as primary targets and tailor channel + pricing + messaging."
+        "GTM implication: pick 1–2 segments to win first, then expand. "
+        "Segments should directly map to channel, pricing, and messaging choices."
     )
 
-    # Optional: allow export of segmented dataset
-    with st.expander("Download segmented dataset"):
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV with segment labels", csv, file_name="iota_segmented_output.csv", mime="text/csv")
+    st.session_state["latest_segmented_df"] = df_seg  # used by perceptual map page
 
-elif page == "Positioning & Perceptual Maps":
-    st.subheader("Positioning & Perceptual Mapping (choose axes + optional clustering overlay)")
+elif page == "Positioning & Perceptual Map":
+    st.subheader("Perceptual Mapping (Best-in-class for your attributes)")
 
-    st.markdown(
-        "A perceptual map is only as good as its axes. Here you can select **any numeric attributes** "
-        "as X and Y. You can also overlay the latest clustering from the STP page by re-running clustering here."
-    )
-
-    # Pick numeric axes
-    numeric_candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if len(numeric_candidates) < 2:
-        st.error("Need at least 2 numeric columns to build perceptual maps.")
+    if not attribute_cols:
+        st.error("No attribute rating columns detected for perceptual mapping.")
         st.stop()
 
-    default_x = "monthly_spend_aed" if "monthly_spend_aed" in numeric_candidates else numeric_candidates[0]
-    default_y = importance_cols[0] if importance_cols and importance_cols[0] in numeric_candidates else numeric_candidates[1]
-
-    x_axis = st.selectbox("X axis (numeric)", numeric_candidates, index=numeric_candidates.index(default_x))
-    y_axis = st.selectbox("Y axis (numeric)", numeric_candidates, index=numeric_candidates.index(default_y))
-
-    st.divider()
-    st.markdown("### Optional: cluster overlay for the perceptual map")
-
-    do_cluster = st.checkbox("Compute clusters and color the map by segment", value=True)
-    k = st.slider("K segments (for overlay)", 3, 8, 4) if do_cluster else None
-
-    color_col = None
-    df_plot = df.copy()
-
-    if do_cluster:
-        # Let user choose which columns to cluster on (not necessarily only x/y)
-        default_cluster_cols = list(set([x_axis, y_axis] + importance_cols[:3] + ["purchase_freq_score"]))
-        default_cluster_cols = [c for c in default_cluster_cols if c in df.columns]
-
-        cluster_cols = st.multiselect(
-            "Attributes to use for clustering overlay",
-            options=df.columns.tolist(),
-            default=default_cluster_cols
-        )
-
-        if len(cluster_cols) >= 2:
-            X_encoded, _ = encode_for_modeling(df_plot[cluster_cols], cluster_cols)
-            Xs = StandardScaler().fit_transform(X_encoded)
-            km = KMeans(n_clusters=k, random_state=42, n_init=20)
-            df_plot["segment"] = km.fit_predict(Xs)
-            color_col = "segment"
-        else:
-            st.warning("Pick at least 2 columns for clustering overlay, or turn it off.")
-            color_col = None
-
-    # Consumer-level perceptual map
-    st.markdown("### Perceptual map (consumer-level)")
-    fig = px.scatter(
-        df_plot,
-        x=x_axis,
-        y=y_axis,
-        color=color_col,
-        title=f"{x_axis} vs {y_axis}",
-        opacity=0.75
+    st.markdown(
+        "This page uses **PCA** on your attribute ratings to create a clean, data-driven perceptual map. "
+        "You can also overlay **KMeans segments**."
     )
-    fig.update_layout(height=650)
+
+    # Compute PCA on attributes
+    attrs = df[attribute_cols].copy()
+    scaler = StandardScaler()
+    attrs_scaled = scaler.fit_transform(attrs)
+
+    pca = PCA(n_components=2, random_state=42)
+    coords = pca.fit_transform(attrs_scaled)
+
+    df_map = df.copy()
+    df_map["pc1"] = coords[:, 0]
+    df_map["pc2"] = coords[:, 1]
+
+    explained = pca.explained_variance_ratio_
+    st.caption(f"PCA variance explained: PC1={explained[0]*100:.1f}% | PC2={explained[1]*100:.1f}%")
+
+    # Optional clustering overlay (reuse from STP if available, else compute quick on attributes)
+    overlay = st.checkbox("Overlay KMeans segments on the map", value=True)
+    if overlay:
+        k = st.slider("Segments (for overlay)", 3, 8, 4)
+
+        km = KMeans(n_clusters=k, random_state=42, n_init=25)
+        df_map["segment"] = km.fit_predict(attrs_scaled)
+        color_col = "segment"
+    else:
+        color_col = None
+
+    fig = px.scatter(
+        df_map,
+        x="pc1",
+        y="pc2",
+        color=color_col,
+        opacity=0.75,
+        title="Perceptual Map (PCA on attribute ratings)"
+    )
+    fig.update_layout(height=650, xaxis_title="Perceptual Axis 1 (PC1)", yaxis_title="Perceptual Axis 2 (PC2)")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(
-        "So what? This shows how consumers distribute across your chosen axes. "
-        "GTM implication: if your target cluster sits in a distinct zone, you can position IOTA to own that zone."
+    st.info(
+        "So what? This map shows how consumer preferences cluster across all your key attributes, not just two chosen axes. "
+        "GTM implication: pick a target cluster and position IOTA to dominate that cluster’s driver bundle."
     )
 
-    # Segment centroid map (if clustering enabled)
-    if do_cluster and "segment" in df_plot.columns:
-        st.markdown("### Segment centroid map (executive-friendly)")
-        centroids = df_plot.groupby("segment")[[x_axis, y_axis]].mean().reset_index()
-        centroids["size"] = df_plot["segment"].value_counts().sort_index().values
+    # Brand-level map: average attribute positions by most purchased brand (if present)
+    if col_brand_buy in df.columns:
+        st.markdown("### Brand-level perceptual map (averages by most purchased brand)")
+        brand_df = df_map.copy()
+        brand_df["brand_key"] = brand_df[col_brand_buy].astype(str).str.strip()
 
-        fig2 = px.scatter(
-            centroids,
-            x=x_axis,
-            y=y_axis,
-            size="size",
-            color="segment",
-            text="segment",
-            title="Segment centroids (size-weighted)"
-        )
-        fig2.update_traces(textposition="top center")
-        fig2.update_layout(height=600)
-        st.plotly_chart(fig2, use_container_width=True)
+        counts = brand_df["brand_key"].value_counts()
+        keep = counts[counts >= 5].index.tolist()
+        brand_df = brand_df[brand_df["brand_key"].isin(keep)].copy()
 
-        st.success(
-            "Positioning implication: pick the segment centroid you want to win first, then design product cues + channel strategy around it."
-        )
+        if not brand_df.empty:
+            brand_centroids = brand_df.groupby("brand_key")[["pc1", "pc2"]].mean().reset_index()
+            brand_centroids["n"] = brand_df["brand_key"].value_counts().values
 
-
+            fig2 = px.scatter(
+                brand_centroids,
+                x="pc1",
+                y="pc2",
+                size="n",
+                text="brand_key",
+                title="Brand centroid map (only brands with >=5 respondents)"
+            )
+            fig2.update_traces(textposition="top center")
+            fig2.update_layout(height=650)
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.warning("Not enough repeated brand selections to build a stable brand-level map (need >=5 per brand).")
 
